@@ -2047,8 +2047,6 @@ fn generate_dflash(
     assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
     pflash_bypass_reason: Option<&str>,
     pflash_alpha: Option<f32>,
-    repeat_penalty: f32,
-    repeat_window: usize,
 ) {
     use hipfire_arch_qwen35::speculative::{
         spec_step_ddtree_batched, spec_step_ddtree_path_c, spec_step_dflash, ModelSlot,
@@ -2221,21 +2219,6 @@ fn generate_dflash(
     let mut think_count: usize = 0;
     let mut prev_in_think = false;
     let mut generated = 0usize;
-    // Think-block policy state machine.
-    //
-    // For thinking=off: ban ALL <think> opens.
-    // For thinking=on: allow ONE <think> block before answer starts.
-    //   Once answer has started (token outside think, not whitespace),
-    //   all subsequent <think> opens are banned.
-    //   Also ban </think> when not inside think.
-    let think_open_id = tokenizer.special_token_id("<think>");
-    let think_close_id = tokenizer.special_token_id("</think>");
-    let thinking_allowed = max_think_tokens > 0 && !matches!(assistant_prefix, hipfire_runtime::prompt_frame::AssistantPrefix::ClosedThink);
-    let mut in_think = false;
-    let mut think_blocks_seen: usize = 0;
-    let mut visible_answer_started = false;
-    let mut think_ban_token_id: Option<u32> = None;
-    let ban_everything = if thinking_allowed { None } else { think_open_id };
 
     // Post-prefill compaction (FlashCASK pattern from dflash_spec_demo).
     // If the prompt already filled past budget+beta, compact once before
@@ -2301,9 +2284,6 @@ fn generate_dflash(
         }
     };
 
-    // N-gram loop guard: detect 4-gram token repetition and force EOS.
-    let loop_guard = hipfire_runtime::loop_guard::LoopGuard::from_env();
-
     // Fast path exit conditions (mirrors the dflash_spec_demo outer loop).
     while generated < max_tokens {
         if position + df.block_size >= ctx_capacity { break; }
@@ -2362,9 +2342,8 @@ fn generate_dflash(
                 &emitted,
                 0.0_f32,                   // cactus_delta
                 None,                      // pld_spine
-                repeat_penalty,
-                repeat_window,
-                think_ban_token_id,
+                1.0_f32,                   // repeat_penalty (off)
+                0,                         // repeat_window
             )
         };
         let step = match step_result {
@@ -2395,59 +2374,6 @@ fn generate_dflash(
             }
             generated += 1;
             if tok == target.config.eos_token || im_end_token == Some(tok) || tokenizer.is_terminator(tok) { hit_eos = true; break; }
-
-            // Think-block policy state machine.
-            //
-            // Update in_think tracking.
-            if Some(tok) == think_open_id && !in_think {
-                in_think = true;
-                think_blocks_seen += 1;
-            } else if Some(tok) == think_close_id && in_think {
-                in_think = false;
-            }
-
-            // Set visible_answer_started when a non-think, non-special
-            // token is emitted and we're not inside a think block.
-            if !in_think && Some(tok) != think_open_id && Some(tok) != think_close_id {
-                visible_answer_started = true;
-            }
-
-            // Decide whether to ban <think> for the NEXT spec cycle:
-            //   - Always ban if thinking=off (ban_everything pre-set)
-            //   - Ban if we've already seen one think block (think_blocks_seen > 0)
-            //   - Ban if visible answer has started and model tries to reopen <think>
-            if ban_everything.is_some() {
-                think_ban_token_id = ban_everything;
-            } else if think_blocks_seen > 0 && visible_answer_started {
-                // Model finished its one allowed think block and started
-                // answering — ban any <think> reopen from here on.
-                think_ban_token_id = think_open_id;
-            } else if Some(tok) == think_open_id && in_think && think_blocks_seen > 0 {
-                // Nested <think> inside the first think block — ban further
-                // opens (but allow the current one to finish normally).
-                think_ban_token_id = think_open_id;
-            }
-            // Ban </think> when not inside think (malformed close).
-            if Some(tok) == think_close_id && !in_think {
-                think_ban_token_id = think_close_id;
-            }
-
-            // N-gram loop detector: if any 4-gram repeats excessively in
-            // the recent window, force EOS to prevent wasting the token
-            // budget on repetitive output.
-            if let Some(hipfire_runtime::loop_guard::StopReason::NgramRepeat { count, .. }) =
-                loop_guard.check(&streamed_tokens)
-            {
-                let window_len = loop_guard.window_len(streamed_tokens.len());
-                let _ = writeln!(
-                    stdout,
-                    r#"{{"type":"info","id":"{}","message":"ngram loop detected (4gram repeated {}× in last {} tokens) — forcing EOS"}}"#,
-                    id, count, window_len
-                );
-                let _ = stdout.flush();
-                hit_eos = true;
-                break;
-            }
 
             // max_think_tokens enforcement (mirrors the AR path). Track
             // <think>/<⁄think> in decoded text and count tokens inside.
@@ -3016,9 +2942,9 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         // mirrors the AR path's <think>/</think> counter). The "ignored
         // on DFlash" warning that used to live here is gone -- the cap
         // is real on both paths now.
-        generate_dflash(m, gpu, stdout, id, prompt, system_prompt, max_tokens, max_think_tokens, assistant_prefix, dflash_bypass_reason, dflash_alpha, repeat_penalty, repeat_window);
+        generate_dflash(m, gpu, stdout, id, prompt, system_prompt, max_tokens, max_think_tokens, assistant_prefix, dflash_bypass_reason, dflash_alpha);
         // Silence unused-variable warnings for the params we didn't need.
-        let _ = (top_p, budget_alert_at_tok, budget_alert_text, pflash_state);
+        let _ = (top_p, repeat_penalty, repeat_window, budget_alert_at_tok, budget_alert_text, pflash_state);
         return;
     }
 
